@@ -682,7 +682,15 @@ tr:hover td{background:rgba(74,158,255,.05)}
 let resultData = null;
 let charts = {};
 
-document.addEventListener("DOMContentLoaded",()=>{initCharts();loadStockList();runBacktest()});
+document.addEventListener("DOMContentLoaded",()=>{initCharts();loadStockList();fetchCached()});
+
+async function fetchCached(){
+  try{
+    const resp=await fetch("/api/backtest");
+    const json=await resp.json();
+    if(json.ok&&json.data){resultData=json.data;renderAll()}
+  }catch(e){}
+}
 window.addEventListener("resize",()=>Object.values(charts).forEach(c=>c?.resize()));
 
 function initCharts(){
@@ -690,6 +698,15 @@ function initCharts(){
   charts.drawdown=echarts.init(document.getElementById("chartDrawdown"));
   charts.stock=echarts.init(document.getElementById("chartStock"));
   charts.bottom=echarts.init(document.getElementById("chartBottomDist"));
+}
+
+async function loadCachedResult(){
+  // 首次加载用GET读缓存（秒开），不跑全套回测
+  try{
+    const resp=await fetch("/api/backtest");
+    const json=await resp.json();
+    if(json.ok){resultData=json.data;renderAll()}
+  }catch(e){console.error(e)}
 }
 
 async function runBacktest(){
@@ -732,10 +749,10 @@ async function loadStockDetail(){
 
 function renderAll(){
   if(!resultData)return;
-  // 合并训练+测试，测试段接在训练段后面
+  try{
   const train=resultData.train, test=resultData.test;
-  // 净值合并
-  // 测试集净值从训练集末尾接续，避免断层
+  if(!train||!test)return;
+  // 净值合并（测试集从训练集末尾接续）
   const trainLast=train.equity_series.length>0?train.equity_series[train.equity_series.length-1][1]:1;
   const testEq=test.equity_series.map(e=>[e[0],e[1]*trainLast]);
   const testDd=test.drawdown_series.map(d=>[d[0],d[1]]);
@@ -744,13 +761,13 @@ function renderAll(){
   // 基准合并
   const bm={};
   for(const k of Object.keys(train.benchmark_series||{})){
-    const bmLast=(train.benchmark_series[k]||[]).length>0?train.benchmark_series[k][train.benchmark_series[k].length-1][1]:1;
-    bm[k]=[...train.benchmark_series[k], ...(test.benchmark_series[k]||[]).map(b=>[b[0],b[1]*bmLast])];
+    bm[k]=[...train.benchmark_series[k], ...(test.benchmark_series[k]||[])];
   }
   renderMetrics(train.summary, test.summary);
   renderEquityChart(eq,dd,bm,train.equity_series.length);
   renderTrades(test.trades, train.trades);
   renderBottomDist();
+  }catch(e){console.error('renderAll error:',e)}
 }
 
 function renderMetrics(train, test){
@@ -798,7 +815,7 @@ function renderEquityChart(equity,drawdown,benchmarks,testStart){
       ])},
       markLine:{silent:true,symbol:"none",data:[
         {yAxis:1,lineStyle:{color:"#6b7d8e",type:"dashed"},label:{color:"#6b7d8e",fontSize:10,formatter:"基准 1.0"}},
-        {xAxis:testStart-1,lineStyle:{color:"#f9ca24",type:"solid",width:2},label:{color:"#f9ca24",fontSize:10,formatter:"测试集开始"}},
+        ...(testStart>0?[{xAxis:testStart-1,lineStyle:{color:"#f9ca24",type:"solid",width:2},label:{color:"#f9ca24",fontSize:10,formatter:"测试集开始"}}]:[]),
       ]},
     },...benchSeries],
   },true);
@@ -827,7 +844,12 @@ function renderTrades(testTrades, trainTrades){
 }
 
 function renderStockChart(data){
-  const dates=data.dates,candles=data.candles.map((c,i)=>[c[0].toFixed(2),c[1].toFixed(2),c[2].toFixed(2),c[3].toFixed(2),c[4]]);
+  const dates=data.dates;
+  const candles=data.candles.map((c,i)=>[c[0],c[1],c[2],c[3],c[4]]);
+  // 构建买卖点（必须在setOption外部）
+  const buyMarks=[],sellMarks=[];
+  (data.buy_points||[]).forEach(p=>buyMarks.push({coord:[p[0],p[1]],symbol:'triangle',symbolSize:14,itemStyle:{color:'#ff0000'},label:{show:true,position:'bottom',formatter:'B',color:'#ff0000',fontSize:11,fontWeight:'bold'}}));
+  (data.sell_points||[]).forEach(p=>sellMarks.push({coord:[p[0],p[1]],symbol:'triangle',symbolSize:14,symbolRotate:180,itemStyle:{color:'#00aa00'},label:{show:true,position:'top',formatter:'S',color:'#00aa00',fontSize:11,fontWeight:'bold'}}));
   charts.stock.setOption({
     tooltip:{trigger:"axis",backgroundColor:"rgba(26,35,50,0.95)",borderColor:"#2a3a4a",textStyle:{color:"#c8d6e5",fontSize:12}},
     grid:[{left:70,right:20,top:10,height:"55%"},{left:70,right:20,top:"72%",height:"23%"}],
@@ -835,16 +857,11 @@ function renderStockChart(data){
            {type:"category",data:dates,gridIndex:1,axisLabel:{show:false},axisLine:{show:false},axisTick:{show:false}}],
     yAxis:[{type:"value",gridIndex:0,axisLabel:{color:"#6b7d8e",fontSize:10},splitLine:{lineStyle:{color:"rgba(42,58,74,0.3)"}},scale:true},
            {type:"value",gridIndex:1,min:0,max:1,axisLabel:{color:"#6b7d8e",fontSize:9,formatter:v=>(v*100).toFixed(0)+"%"},splitLine:{lineStyle:{color:"rgba(42,58,74,0.2)"}}}],
-    // 构建买卖点标记
-    const buyMarks=[],sellMarks=[];
-    if(data.buy_points) data.buy_points.forEach(p=>buyMarks.push({coord:[p[0],p[1]],value:p[1],symbol:'triangle',symbolSize:14,itemStyle:{color:'#ff0000'},label:{show:true,position:'bottom',formatter:'买',color:'#ff0000',fontSize:11,fontWeight:'bold'}}));
-    if(data.sell_points) data.sell_points.forEach(p=>sellMarks.push({coord:[p[0],p[1]],value:p[1],symbol:'triangle',symbolSize:14,symbolRotate:180,itemStyle:{color:'#00ff00'},label:{show:true,position:'top',formatter:'卖',color:'#00ff00',fontSize:11,fontWeight:'bold'}}));
-
     series:[
       {type:"candlestick",name:"K线",data:candles,xAxisIndex:0,yAxisIndex:0,
        itemStyle:{color:"#ff0000",color0:"#00aa00",borderColor:"#ff0000",borderColor0:"#00aa00"}},
-      {type:"scatter",name:"买入",data:buyMarks,xAxisIndex:0,yAxisIndex:0,z:10,symbolSize:14,itemStyle:{color:"#ff0000"},label:{show:true,position:'bottom',formatter:'B',color:'#ff0000',fontSize:11,fontWeight:'bold'}},
-      {type:"scatter",name:"卖出",data:sellMarks,xAxisIndex:0,yAxisIndex:0,z:10,symbolSize:14,itemStyle:{color:"#00aa00"},label:{show:true,position:'top',formatter:'S',color:'#00aa00',fontSize:11,fontWeight:'bold'}},
+      {type:"scatter",name:"买入",data:buyMarks,xAxisIndex:0,yAxisIndex:0,z:10},
+      {type:"scatter",name:"卖出",data:sellMarks,xAxisIndex:0,yAxisIndex:0,z:10},
       {type:"line",name:"MA60偏离",data:data.bottom,xAxisIndex:1,yAxisIndex:1,
        symbol:"none",smooth:true,lineStyle:{color:"#f9ca24",width:2},
        areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:"rgba(249,202,36,0.2)"},{offset:1,color:"rgba(249,202,36,0.0)"}])},
@@ -854,7 +871,6 @@ function renderStockChart(data){
     ],
   },true);
 }
-
 function renderBottomDist(){
   // 300只股票的底部距离分布（模拟）
   const bins=10,categories=["0-10%","10-20%","20-30%","30-40%","40-50%","50-60%","60-70%","70-80%","80-90%","90-100%"];
@@ -912,8 +928,17 @@ if __name__ == "__main__":
     # 测试集净值只保留交易期部分
     test_result["equity_series"] = [e for e in test_result["equity_series"] if e[0] >= TEST_TRADE_START]
     test_result["drawdown_series"] = [d for d in test_result["drawdown_series"] if d[0] >= TEST_TRADE_START]
+    # 基准指数：测试集重新归一化到训练集的基准，消除接头断层
     for k in test_result.get("benchmark_series", {}):
-        test_result["benchmark_series"][k] = [b for b in test_result["benchmark_series"][k] if b[0] >= TEST_TRADE_START]
+        filtered = [b for b in test_result["benchmark_series"][k] if b[0] >= TEST_TRADE_START]
+        if filtered and k in train_result.get("benchmark_series", {}):
+            train_bm = train_result["benchmark_series"][k]
+            if train_bm:
+                train_last = train_bm[-1][1]   # 训练集末的基准值
+                test_first = filtered[0][1]     # 测试集首的基准值（旧归一化）
+                scale = train_last / test_first if test_first > 0 else 1.0
+                filtered = [[b[0], round(b[1]*scale, 4)] for b in filtered]
+        test_result["benchmark_series"][k] = filtered
     _cached_result = {"train": train_result, "test": test_result, "params": DEFAULT_CONFIG}
     ts = train_result["summary"]
     vs = test_result["summary"]
