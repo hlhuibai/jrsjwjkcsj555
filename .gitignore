@@ -1,0 +1,11 @@
+# 数据缓存（体积大，不提交）
+.data_cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时文件
+*.json
+*.bak
