@@ -186,69 +186,57 @@ def calc_main_force_score(
     high, low, close, volume, amount=None, period=14
 ):
     """
-    主力综合评分 (0-100)
-    整合多个维度的信号生成综合评分：
-    - 资金流向
-    - 量价关系
-    - 筹码集中度
-    - 异常放量
+    趋势强度评分 (0-100)
+    专注于趋势行情判断：资金流向 + 均线排列 + 量能趋势 + 短期动量
     """
     n = len(close)
-
-    # 子指标
-    institutional_flow = calc_institutional_flow(high, low, close, volume)
-    mfi = calc_mfi(high, low, close, volume, period)
-    vr = calc_volume_ratio(volume, ma_period=20)
-    concentration = calc_chip_concentration(close, volume, 60)
-    abnormal_vol = calc_abnormal_volume(volume, 20, 1.5)
-
-    # 统一量纲到 0-100
     scores = np.zeros(n)
 
-    for i in range(max(period, 60), n):
+    # 均线
+    ma5 = rolling_mean(close, 5)
+    ma10 = rolling_mean(close, 10)
+    ma20 = rolling_mean(close, 20)
+
+    # 资金流向
+    inst_flow = calc_institutional_flow(high, low, close, volume)
+
+    # 量能趋势
+    vol_ma5 = rolling_mean(volume, 5)
+    vol_ma20 = rolling_mean(volume, 20)
+
+    for i in range(60, n):
         s = 0.0
 
-        # 1. 机构资金流强度 (权重 35%)
-        flow_val = institutional_flow[i]
-        flow_std = np.nanstd(institutional_flow[i - period : i + 1])
+        # ① 资金流向强度 (40分)
+        flow_val = inst_flow[i]
+        flow_std = np.nanstd(inst_flow[max(0,i-14):i+1])
         if flow_std > 0:
-            s += 35.0 * min(max((flow_val / flow_std + 1.0) / 2.0, 0), 1)
+            s += 40.0 * min(max((flow_val / flow_std + 1.0) / 2.0, 0), 1)
 
-        # 2. MFI 位置 (权重 20%)
-        mfi_val = mfi[i]
-        if not np.isnan(mfi_val):
-            if 30 <= mfi_val <= 70:
-                s += 20.0  # 健康区间
-            elif mfi_val < 30:
-                s += 20.0 * (1.0 - (30 - mfi_val) / 30)  # 超卖，可能吸筹
-            else:
-                s += 20.0 * max(1.0 - (mfi_val - 70) / 30, 0)  # 超买降温
+        # ② 均线多头排列 (25分) — MA5 > MA10 > MA20
+        if not any(np.isnan([ma5[i], ma10[i], ma20[i]])):
+            if ma5[i] > ma10[i] > ma20[i]:
+                s += 25.0  # 完美多头
+            elif ma5[i] > ma20[i]:
+                s += 15.0  # 部分多头
 
-        # 3. 量比 (权重 20%)
-        vr_val = vr[i]
-        if not np.isnan(vr_val):
-            if 1.0 <= vr_val <= 2.5:
-                s += 20.0  # 温和放量，主力稳步推进
-            elif 0.6 <= vr_val < 1.0:
-                s += 12.0  # 缩量，观望
-            elif vr_val > 2.5:
-                s += 10.0  # 过度放量，警惕出货
+        # ③ 量能趋势 (20分) — 近期放量
+        if not np.isnan(vol_ma5[i]) and not np.isnan(vol_ma20[i]) and vol_ma20[i] > 0:
+            vol_ratio = vol_ma5[i] / vol_ma20[i]
+            if 1.0 <= vol_ratio <= 2.0:
+                s += 20.0  # 温和放量
+            elif vol_ratio > 2.0:
+                s += 12.0  # 过度放量
+            elif vol_ratio >= 0.8:
+                s += 8.0   # 量能持平
 
-        # 4. 筹码集中度 (权重 15%)
-        conc_val = concentration[i]
-        if not np.isnan(conc_val):
-            # 集中度越低越好（0.05 以下 = 高度集中）
-            if conc_val < 0.05:
-                s += 15.0
-            elif conc_val < 0.10:
-                s += 10.0
-            elif conc_val < 0.15:
-                s += 5.0
-
-        # 5. 异常放量信号 (权重 10%)
-        ab_val = abnormal_vol[i]
-        if ab_val > 0:
-            s += min(ab_val / 4.0, 1.0) * 10.0
+        # ④ 短期动量 (15分) — 10日涨幅
+        if i >= 10 and close[i-10] > 0:
+            ret_10d = (close[i] - close[i-10]) / close[i-10]
+            if 0.05 <= ret_10d <= 0.30:
+                s += 15.0  # 温和上涨
+            elif 0 <= ret_10d < 0.05:
+                s += 8.0   # 横盘
 
         scores[i] = s
 
@@ -303,55 +291,3 @@ def detect_distribution(close, volume, window=20):
             signal[i] = 1.0
 
     return signal
-
-
-def calc_bottom_distance(close, window=60):
-    """
-    股价相对60日均线的偏离度 (0-1)
-    0 = 价格在MA60上方（非底部）
-    1 = 价格远低于MA60（深度底部）
-    """
-    n = len(close)
-    result = np.full(n, np.nan)
-    ma = rolling_mean(close, window)
-
-    for i in range(window, n):
-        if np.isnan(ma[i]) or ma[i] <= 0:
-            continue
-        # 偏离度：低于MA60越多值越大
-        deviation = (ma[i] - close[i]) / ma[i]
-        result[i] = max(0.0, min(1.0, deviation / 0.30))  # 偏离30%封顶
-
-    return result
-
-
-def calc_bottom_signal(close, volume, window=60, bottom_pct=0.20):
-    """
-    底部+吸筹综合信号 (基于60日均线)
-    底部条件：股价不超过MA60上方20%（即 close <= MA60 * 1.20）
-    """
-    n = len(close)
-    ma = rolling_mean(close, window)
-    acc = detect_accumulation(close, volume, 20)
-
-    bottom_score = np.zeros(n)
-    acc_ok = np.zeros(n)
-    combined = np.zeros(n)
-
-    for i in range(window, n):
-        if np.isnan(ma[i]) or ma[i] <= 0:
-            continue
-        # 偏离率：正=低于MA60，负=高于MA60
-        dev = (ma[i] - close[i]) / ma[i]
-        # 评分：低于MA60得高分，超过MA60+20%得0分
-        if close[i] <= ma[i] * 1.20:
-            # 从MA60*1.20到MA60*0.70映射为0到100
-            bottom_score[i] = max(0.0, min(100.0, 100.0 * (1.0 - (close[i] - ma[i]*0.70) / (ma[i]*0.50))))
-        else:
-            bottom_score[i] = 0.0
-
-        acc_ok[i] = acc[i]
-        if bottom_score[i] >= 60 and acc[i] > 0.5:
-            combined[i] = 1.0
-
-    return bottom_score, acc_ok, combined

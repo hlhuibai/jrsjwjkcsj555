@@ -8,7 +8,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 from indicators import (
     calc_main_force_score, calc_institutional_flow, calc_mfi,
     detect_accumulation, detect_distribution,
-    calc_bottom_distance, calc_bottom_signal,
 )
 
 FULL_UNIVERSE = [
@@ -160,7 +159,9 @@ def _fetch_ak_index(symbol, start, end):
         df.set_index("date", inplace=True)
         df = df.loc[pd.Timestamp(start):pd.Timestamp(end)]
         df["symbol"] = symbol
-        return df[["close","symbol"]]
+        cols = ["close","symbol"]
+        if "volume" in df.columns: cols.append("volume")
+        return df[cols]
     except: return None
 
 MARKET_EVENTS = [
@@ -188,12 +189,11 @@ def generate_price_data(symbol, start, end, seed=None):
     if cache_key in _data_cache: return _data_cache[cache_key]
     df = _load_cache(symbol, start, end)
     if df is not None: _data_cache[cache_key] = df; return df
-    # 仅对已有缓存路径的尝试akshare（跳过无缓存股票以加速）
-    if os.path.exists(_cache_path(symbol, start, end)):
-        df = _fetch_tx_stock(symbol, start, end)
-        if df is not None:
-            _data_cache[cache_key] = df; _save_cache(symbol, start, end, df)
-            return df
+    # 优先尝试akshare拉取真实数据
+    df = _fetch_tx_stock(symbol, start, end)
+    if df is not None:
+        _data_cache[cache_key] = df; _save_cache(symbol, start, end, df)
+        return df
 
     # 合成
     rng = np.random.default_rng(seed)
@@ -255,6 +255,27 @@ def generate_index_data(symbol, name, start, end):
 # 策略引擎：底部+主力吸筹
 # ═══════════════════════════════════════════════════════════
 
+def _load_all_mcap():
+    """启动时一次性加载全部市值数据到内存"""
+    try:
+        import pandas as pd, os, glob
+        mcap = {}
+        for path in glob.glob(os.path.join(_CACHE_DIR, "mcap", "*.pkl")):
+            code = os.path.basename(path).replace(".pkl", "")
+            try:
+                df = pd.read_pickle(path)
+                if df is not None and len(df) > 0:
+                    df["date"] = pd.to_datetime(df.iloc[:, 0])
+                    df.set_index("date", inplace=True)
+                    mcap[code] = df.iloc[:, 3] / 1e8  # 总市值列(索引3，单位元→亿)
+            except: pass
+        return mcap
+    except: return {}
+
+# 模块级缓存
+_mcap_cache = _load_all_mcap()
+
+
 def run_full_backtest(config):
     cfg = {**DEFAULT_CONFIG, **config}
     initial_capital = cfg["initial_capital"]
@@ -285,7 +306,16 @@ def run_full_backtest(config):
     total_commission = 0.0
     lookback = 60
     max_analyze = 50
-    _score_cache = {}  # (sym, idx) -> (mf_score, acc_signal)
+    _score_cache = {}
+
+    def _is_one_word(df_sym, dt):
+        """一字板检测：开盘=最高=最低=收盘，全天无波动"""
+        if dt not in df_sym.index: return False, None
+        row = df_sym.loc[dt]
+        o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+        if h == l:  # 全天无价格波动 = 一字板
+            return True, "涨停" if c >= o else "跌停"
+        return False, None
 
     _lp = {}
     def _p(sym, dt):
@@ -300,46 +330,60 @@ def run_full_backtest(config):
             daily_values.append({"date": date, "value": initial_capital})
             continue
 
-        # Stage 1: 快速底部扫描（60日MA偏离度）
-        bottom_candidates = []
+        # Stage 1: 全市场扫涨停放量（不限底部，牛熊通吃）
+        candidates = []
         for sym, info in all_data.items():
             df = info["df"]
             if date not in df.index: continue
             idx = df.index.get_loc(date)
-            if idx < 60: continue
-            close_arr = df["close"].iloc[max(0,idx-60):idx+1].values
-            ma60 = np.mean(close_arr)
-            if ma60 <= 0: continue
-            if close_arr[-1] > ma60 * 1.20: continue  # 超过MA60+20%不算底部
-            score = max(0.0, min(100.0, 100.0 * (ma60 * 1.20 - close_arr[-1]) / (ma60 * 0.40)))
-            if score >= 60:
-                bottom_candidates.append((sym, score, df, idx))
+            if idx < 20: continue
+            # 5日内涨停(>=9.5%)且当日量>20日均量×2 = 大资金进场信号
+            vol_ma20 = df["volume"].iloc[max(0,idx-20):idx+1].mean()
+            if vol_ma20 <= 0: continue
+            breakout_score = 0.0
+            for j in range(max(1, idx-5), idx+1):
+                if j >= len(df): break
+                pct = (df["close"].iloc[j] - df["close"].iloc[j-1]) / df["close"].iloc[j-1]
+                vol = df["volume"].iloc[j]
+                if pct >= 0.08 and vol > vol_ma20 * 2.0:
+                    # 涨幅越大、量越大、越近期 → 分越高
+                    recency = 1.0 - (idx - j) / 5.0
+                    vol_ratio = min(vol / (vol_ma20 * 2.0), 3.0)
+                    breakout_score = 100.0 * recency * 0.5 + 100.0 * (vol_ratio / 3.0) * 0.5
+                    break
+            # 市值过滤：真实市值 > 300亿（内存查找，极快）
+            code = sym.split(".")[0]
+            if code in _mcap_cache:
+                mcap_series = _mcap_cache[code]
+                date_str = df.index[idx]
+                # 找该日期之前最近的市值
+                valid = mcap_series[mcap_series.index <= date_str]
+                mcap_val = float(valid.iloc[-1]) if len(valid) > 0 else 0
+            else:
+                mcap_val = 999  # 无数据默认放行
+            # 5日涨幅过滤：前5日已涨超30%不追（接盘风险）
+            if idx >= 5:
+                close_5d_ago = df["close"].iloc[idx-5]
+                gain_5d = (df["close"].iloc[idx] - close_5d_ago) / close_5d_ago
+                if gain_5d > 0.30: continue
 
-        # Stage 2: 深度分析（最多80只）
-        bottom_candidates.sort(key=lambda x: x[1], reverse=True)
+            if breakout_score >= 50 and mcap_val > 100:
+                candidates.append((sym, breakout_score, df, idx))
+
+        # Stage 2: 涨停放量股做主力确认（TOP80）
+        candidates.sort(key=lambda x: x[1], reverse=True)
         detailed = []
-        for sym, b_score, df, idx in bottom_candidates[:max_analyze]:
+        for sym, bk_score, df, idx in candidates[:max_analyze]:
             ck = (sym, idx)
             if ck in _score_cache:
-                mf, breakout = _score_cache[ck]
+                mf = _score_cache[ck]
             else:
                 hist = df.iloc[max(0,idx-120):idx+1]
                 mf_arr = calc_main_force_score(hist["high"].values, hist["low"].values,
                                                hist["close"].values, hist["volume"].values, 14)
                 mf = float(mf_arr[-1]) if not np.isnan(mf_arr[-1]) else 50.0
-                # 底部涨停放量检测：5日内涨停(>=9.5%) + 涨停日量>20日均量×2
-                breakout = 0.0
-                if idx >= 5:
-                    look = df.iloc[idx-5:idx+1]
-                    vol_ma20 = df["volume"].iloc[max(0,idx-20):idx+1].mean()
-                    for j in range(1, len(look)):
-                        pct = (look["close"].iloc[j] - look["close"].iloc[j-1]) / look["close"].iloc[j-1]
-                        vol = look["volume"].iloc[j]
-                        if pct >= 0.07 and vol > vol_ma20 * 1.5:
-                            breakout = 1.0
-                            break
-                _score_cache[ck] = (mf, breakout)
-            detailed.append((sym, b_score, mf, breakout))
+                _score_cache[ck] = mf
+            detailed.append((sym, bk_score, mf))
 
         # 总资产
         tv = cash
@@ -347,39 +391,95 @@ def run_full_backtest(config):
             p = _p(s, date)
             if p is not None: tv += positions[s]["shares"] * p
 
-        # 卖出：止损/止盈（仅在交易期内执行）
+        # ── 大盘风控：沪深300 < MA20 且 量 < MA5 → 总仓位 ≤ 20% ──
+        risk_off = False
+        hs300 = benchmark_data.get("000300.SH")
+        if hs300 is not None and date in hs300.index:
+            idx_hs = hs300.index.get_loc(date)
+            if idx_hs >= 20:
+                ma20 = float(hs300["close"].iloc[max(0,idx_hs-20):idx_hs+1].mean())
+                ma5_vol = float(hs300["volume"].iloc[max(0,idx_hs-5):idx_hs+1].mean())
+                today_close = float(hs300["close"].iloc[idx_hs])
+                today_vol = float(hs300["volume"].iloc[idx_hs])
+                if today_close < ma20 and today_vol < ma5_vol:
+                    risk_off = True
+
+        # 卖出：止损/半仓止盈/移动止损
         if date.strftime("%Y-%m-%d") >= trade_start:
+            # 今日有买入信号的股票不卖出
+            buy_candidates_today = {sym for sym, _, _ in detailed}
             for sym in list(positions.keys()):
+                if sym in buy_candidates_today: continue  # 有买点则忽略卖点
                 pos = positions[sym]
                 if pos["shares"] <= 0: continue
                 price = _p(sym, date)
                 if price is None: continue
+
+                # 一字跌停卖不出
+                df_sym = all_data[sym]["df"]
+                one_word, direction = _is_one_word(df_sym, date)
+                if one_word and direction == "跌停": continue
+
+                # 更新持仓最高价（用于移动止损）
+                if price > pos.get("high_price", 0):
+                    pos["high_price"] = price
+
                 pnl = (price - pos["avg_cost"]) / pos["avg_cost"]
+                dd_from_high = (price - pos["high_price"]) / pos["high_price"] if pos["high_price"] > 0 else 0
+                half_taken = pos.get("half_taken", False)
                 reason = None
-                if pnl <= stop_loss: reason = f"止损({pnl*100:.1f}%)"
-                elif pnl >= take_profit: reason = f"止盈(+{pnl*100:.1f}%)"
-                if reason:
-                    proceeds = pos["shares"] * price
+                shares_to_sell = 0
+
+                if half_taken:
+                    # 已止盈半仓 → 剩余仓位移动止损15%
+                    if dd_from_high <= -0.15:
+                        reason = f"移动止损(回撤{dd_from_high*100:.1f}%)"
+                        shares_to_sell = pos["shares"]
+                else:
+                    # 未止盈 → 止损8% 或 止盈20%减半仓
+                    if pnl <= stop_loss:
+                        reason = f"止损({pnl*100:.1f}%)"
+                        shares_to_sell = pos["shares"]
+                    elif pnl >= take_profit:
+                        reason = f"止盈半仓(+{pnl*100:.1f}%)"
+                        shares_to_sell = pos["shares"] // 200 * 100  # 卖一半，整手
+
+                if reason and shares_to_sell >= 100:
+                    proceeds = shares_to_sell * price
                     comm = max(proceeds * 0.00061, 5)
                     total_commission += comm
                     cash += proceeds - comm
+                    pos["shares"] -= shares_to_sell
                     trades.append({"date":date.strftime("%Y-%m-%d"),"symbol":sym,
                         "name":all_data[sym]["name"],"action":"sell","price":round(price,2),
-                        "shares":pos["shares"],"amount":round(proceeds,0),
+                        "shares":shares_to_sell,"amount":round(proceeds,0),
                         "pnl_pct":round(pnl*100,2),"reason":reason})
-                    del positions[sym]
+                    if pos["shares"] < 100:
+                        del positions[sym]  # 不够一手，清掉
+                    elif not half_taken:
+                        pos["half_taken"] = True  # 标记已减半
 
-        # 买入：底部涨停放量 = 主升信号
+        # ── 买入：当日以最高价×98.2%成交（模拟盘中追涨）──
         if date.strftime("%Y-%m-%d") >= trade_start:
-            for sym, b_score, mf, breakout in detailed:
+            current_total_pct = (tv - cash) / tv if tv > 0 else 0
+            max_allowed_pct = 0.20 if risk_off else 1.0
+
+            for sym, bk_score, mf in detailed:
                 if len(positions) >= max_positions: break
                 if sym in positions: continue
                 if mf < 40: continue
-                if breakout < 0.5: continue  # 无底部涨停放量信号
+                if risk_off and current_total_pct >= max_allowed_pct: break
 
-                price = _p(sym, date)
-                if price is None: continue
-                target_pct = 0.05 + (max_single_pct - 0.05) * (b_score / 100.0)
+                df_sym = all_data[sym]["df"]
+                if date not in df_sym.index: continue
+                # 一字涨停买不进
+                one_word, _ = _is_one_word(df_sym, date)
+                if one_word: continue
+                day_high = float(df_sym.loc[date, "high"])
+                price = day_high * 0.982
+                if price <= 0: continue
+
+                target_pct = 0.05 + (max_single_pct - 0.05) * (bk_score / 100.0)
                 tgt_val = min(target_pct * tv, cash * (1 - reserve))
                 if tgt_val < 5000: continue
                 shares = int(tgt_val / price / 100) * 100
@@ -390,17 +490,36 @@ def run_full_backtest(config):
                 total_commission += comm
                 cash -= cost
                 positions[sym] = {"shares":shares,"avg_cost":price,
-                                  "entry_date":date.strftime("%Y-%m-%d"),"high_price":price}
+                    "entry_date":date.strftime("%Y-%m-%d"),"high_price":price,
+                    "half_taken":False}
                 trades.append({"date":date.strftime("%Y-%m-%d"),"symbol":sym,
                     "name":all_data[sym]["name"],"action":"buy","price":round(price,2),
                     "shares":shares,"amount":round(cost,0),"pnl_pct":0,
-                    "reason":f"底部涨停 底分={b_score:.0f} 仓={target_pct*100:.0f}%"})
+                    "reason":f"涨停放量 强度={bk_score:.0f} 仓={target_pct*100:.0f}%"})
 
         # 净值
         sv = sum(pos["shares"]*_p(s,date) for s,pos in positions.items() if _p(s,date) is not None)
         tv = cash + sv
         daily_values.append({"date":date.strftime("%Y-%m-%d"),"value":round(tv,2),
                              "cash":round(cash,2),"stock_value":round(sv,2)})
+
+    # ── 最终持仓 ──
+    holdings = []
+    last_date = all_dates[-1]
+    for sym, pos in positions.items():
+        if pos["shares"] <= 0: continue
+        p = _p(sym, last_date)
+        if p is None: continue
+        pnl = (p - pos["avg_cost"]) / pos["avg_cost"]
+        holdings.append({
+            "symbol": sym,
+            "name": all_data[sym]["name"],
+            "shares": pos["shares"],
+            "avg_cost": round(pos["avg_cost"], 2),
+            "price": round(p, 2),
+            "pnl_pct": round(pnl * 100, 2),
+            "value": round(pos["shares"] * p, 0),
+        })
 
     # 统计
     dv = pd.DataFrame(daily_values)
@@ -459,6 +578,7 @@ def run_full_backtest(config):
         "drawdown_series": dd,
         "trades": trades[-50:],
         "benchmark_series": bm,
+        "holdings": holdings,
         "universe_size": len(FULL_UNIVERSE),
     }
 
@@ -472,12 +592,12 @@ def run_dual_period(config=None):
     test_cfg  = {**cfg, "start_date": TEST_PERIOD[0],  "end_date": TEST_PERIOD[1], "trade_start": TEST_TRADE_START}
     train_result = run_full_backtest(train_cfg)
     test_result  = run_full_backtest(test_cfg)
-    # 测试集净值只保留交易期
-    test_result["equity_series"] = [e for e in test_result["equity_series"] if e[0] >= TEST_TRADE_START]
-    test_result["drawdown_series"] = [d for d in test_result["drawdown_series"] if d[0] >= TEST_TRADE_START]
+    # 测试集净值只保留交易期（跳过01-01假期等非交易日）
+    test_result["equity_series"] = [e for e in test_result["equity_series"] if e[0] > TEST_TRADE_START]
+    test_result["drawdown_series"] = [d for d in test_result["drawdown_series"] if d[0] > TEST_TRADE_START]
     # 基准指数重新归一化到训练集，消除接头断层
     for k in test_result.get("benchmark_series", {}):
-        filtered = [b for b in test_result["benchmark_series"][k] if b[0] >= TEST_TRADE_START]
+        filtered = [b for b in test_result["benchmark_series"][k] if b[0] > TEST_TRADE_START]
         if filtered and k in train_result.get("benchmark_series", {}):
             train_bm = train_result["benchmark_series"][k]
             if train_bm:

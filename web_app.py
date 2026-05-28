@@ -16,7 +16,7 @@ from engine import (
 )
 from indicators import (
     calc_main_force_score, calc_institutional_flow, calc_mfi,
-    detect_accumulation, calc_bottom_distance,
+    detect_accumulation,
 )
 
 app = Flask(__name__)
@@ -59,7 +59,6 @@ def api_stock_detail(symbol):
     mfi_vals = calc_mfi(high, low, close, volume, 14)
     flow_vals = calc_institutional_flow(high, low, close, volume)
     acc = detect_accumulation(close, volume, 20)
-    btm = calc_bottom_distance(close, 60)
     dates = [d.strftime("%Y-%m-%d") for d in df.index]
     # 获取该股的买卖点
     buy_pts, sell_pts = [], []
@@ -78,7 +77,6 @@ def api_stock_detail(symbol):
         "mfi":[float(m) if not np.isnan(m) else None for m in mfi_vals],
         "flow":[float(f) if not np.isnan(f) else None for f in flow_vals],
         "accumulation":[float(a) for a in acc],
-        "bottom":[float(b) if not np.isnan(b) else None for b in btm],
         "buy_points": buy_pts,
         "sell_points": sell_pts,
     }})
@@ -98,7 +96,7 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>底部吸筹策略 - 回测仪表板</title>
+<title>涨停放量策略 - 回测仪表板</title>
 <script src="/echarts.min.js"></script>
 <style>
 :root{--bg:#0f1923;--card-bg:#1a2332;--border:#2a3a4a;--text:#c8d6e5;--text-dim:#6b7d8e;--green:#00d4aa;--red:#ff4757;--blue:#4a9eff;--accent:#f9ca24}
@@ -149,7 +147,7 @@ tr:hover td{background:rgba(74,158,255,.05)}
 </head>
 <body>
 <header>
-  <h1>底部吸筹策略 · 回测仪表板</h1>
+  <h1>涨停放量策略 · 回测仪表板</h1>
   <div class="controls">
     <div class="spinner" id="spinner"></div>
     <button class="btn-config" onclick="openConfig()">参数配置</button>
@@ -158,6 +156,17 @@ tr:hover td{background:rgba(74,158,255,.05)}
 </header>
 <main>
   <div class="metrics-grid" id="metricsGrid"></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px">
+    <div class="table-box" style="max-height:200px">
+      <h3>训练集持仓 <span id="trainHoldingVal" style="font-size:12px;color:var(--text-dim)"></span></h3>
+      <table><thead><tr><th>股票</th><th>手</th><th>成本</th><th>现价</th><th>浮盈%</th></tr></thead><tbody id="trainHoldingBody"><tr><td colspan="5" style="text-align:center;color:var(--text-dim)">暂无</td></tr></tbody></table>
+    </div>
+    <div class="table-box" style="max-height:200px">
+      <h3>测试集持仓 <span id="testHoldingVal" style="font-size:12px;color:var(--text-dim)"></span></h3>
+      <table><thead><tr><th>股票</th><th>手</th><th>成本</th><th>现价</th><th>浮盈%</th></tr></thead><tbody id="testHoldingBody"><tr><td colspan="5" style="text-align:center;color:var(--text-dim)">暂无</td></tr></tbody></table>
+    </div>
+  </div>
+
   <div class="chart-grid">
     <div class="chart-box"><h3>净值曲线</h3><div class="chart" id="chartEquity"></div></div>
     <div class="chart-box"><h3>回撤曲线</h3><div class="chart" id="chartDrawdown"></div></div>
@@ -167,10 +176,6 @@ tr:hover td{background:rgba(74,158,255,.05)}
       <h3>个股K线 + 买卖点</h3>
       <select id="stockSelect" onchange="loadStockDetail()" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 12px;"></select>
       <div class="chart" id="chartStock" style="height:450px;"></div>
-    </div>
-    <div class="chart-box">
-      <h3>底部信号分布</h3>
-      <div class="chart" id="chartBottomDist" style="height:450px;"></div>
     </div>
   </div>
   <div class="table-box">
@@ -218,7 +223,6 @@ function initCharts(){
   charts.equity=echarts.init(document.getElementById("chartEquity"));
   charts.drawdown=echarts.init(document.getElementById("chartDrawdown"));
   charts.stock=echarts.init(document.getElementById("chartStock"));
-  charts.bottom=echarts.init(document.getElementById("chartBottomDist"));
 }
 async function fetchCached(){
   try{const r=await fetch("/api/backtest");const j=await r.json();if(j.ok&&j.data){resultData=j.data;renderAll()}}catch(e){}
@@ -265,8 +269,8 @@ function renderAll(){
     renderMetrics(train.summary,test.summary);
     renderEquityChart(eq,dd,bm,train.equity_series.length);
     renderTrades(test.trades,train.trades);
-    renderBottomDist();
-  }catch(e){console.error(e)}
+    renderHoldings(train.holdings,test.holdings);
+    }catch(e){console.error(e)}
 }
 function renderMetrics(train,test){
   const card=(l,v1,v2,c,u)=>
@@ -286,29 +290,29 @@ function renderMetrics(train,test){
     card("手续费",(train.total_commission||0).toLocaleString(),(test.total_commission||0).toLocaleString(),'','元');
 }
 function renderEquityChart(equity,drawdown,benchmarks,testStart){
-  const dates=equity.map(e=>e[0]),values=equity.map(e=>e[1]),ddVals=drawdown.map(d=>d[1]);
+  // time轴按真实日历对齐，消除节假日偏差
+  const eqData=equity.map(e=>[e[0],e[1]]),ddData=drawdown.map(d=>[d[0],d[1]]);
   const benchColors={"沪深300":"#f9ca24","创业板指":"#ff6b6b","科创50":"#00d4aa"};
-  const bs=Object.entries(benchmarks||{}).map(([n,s])=>({type:"line",name:n,data:s.map(x=>x?x[1]:null),smooth:true,symbol:"none",lineStyle:{color:benchColors[n]||"#888",width:1.5,type:"dashed"}}));
+  const bs=Object.entries(benchmarks||{}).map(([n,s])=>({type:"line",name:n,data:s.filter(x=>x&&x[1]!=null).map(x=>[x[0],x[1]]),smooth:true,symbol:"none",lineStyle:{color:benchColors[n]||"#888",width:1.5,type:"dashed"}}));
   charts.equity.setOption({
     tooltip:{trigger:"axis",backgroundColor:"rgba(26,35,50,0.95)",borderColor:"#2a3a4a",textStyle:{color:"#c8d6e5",fontSize:12}},
     legend:{data:["策略净值",...Object.keys(benchmarks||{})],bottom:0,textStyle:{color:"#6b7d8e",fontSize:10}},
     grid:{left:60,right:30,top:10,bottom:40},
-    xAxis:{type:"category",data:dates,axisLine:{lineStyle:{color:"#2a3a4a"}},axisLabel:{color:"#6b7d8e",fontSize:10,formatter:v=>v.slice(5)}},
+    xAxis:{type:"time",axisLine:{lineStyle:{color:"#2a3a4a"}},axisLabel:{color:"#6b7d8e",fontSize:10},splitLine:{show:false}},
     yAxis:{type:"value",axisLabel:{color:"#6b7d8e",fontSize:10,formatter:v=>v.toFixed(2)},splitLine:{lineStyle:{color:"rgba(42,58,74,0.3)"}},scale:true},
-    series:[{type:"line",name:"策略净值",data:values,smooth:true,symbol:"none",lineStyle:{color:"#4a9eff",width:2.5},
+    series:[{type:"line",name:"策略净值",data:eqData,smooth:true,symbol:"none",lineStyle:{color:"#4a9eff",width:2.5},
       areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:"rgba(74,158,255,0.18)"},{offset:1,color:"rgba(74,158,255,0.0)"}])},
       markLine:{silent:true,symbol:"none",data:[
         {yAxis:1,lineStyle:{color:"#6b7d8e",type:"dashed"},label:{color:"#6b7d8e",fontSize:10,formatter:"基准 1.0"}},
-        ...(testStart>0?[{xAxis:testStart-1,lineStyle:{color:"#f9ca24",type:"solid",width:2},label:{color:"#f9ca24",fontSize:10,formatter:"测试集开始"}}]:[]),
       ]},
     },...bs],
   },true);
   charts.drawdown.setOption({
-    tooltip:{trigger:"axis",backgroundColor:"rgba(26,35,50,0.95)",borderColor:"#2a3a4a",textStyle:{color:"#c8d6e5",fontSize:12},formatter:p=>`<b>${p[0].axisValue}</b><br/>回撤: <b style="color:#ff4757">${p[0].value}%</b>`},
+    tooltip:{trigger:"axis",backgroundColor:"rgba(26,35,50,0.95)",borderColor:"#2a3a4a",textStyle:{color:"#c8d6e5",fontSize:12}},
     grid:{left:60,right:20,top:10,bottom:30},
-    xAxis:{type:"category",data:dates,axisLine:{lineStyle:{color:"#2a3a4a"}},axisLabel:{color:"#6b7d8e",fontSize:10,formatter:v=>v.slice(5)}},
+    xAxis:{type:"time",axisLine:{lineStyle:{color:"#2a3a4a"}},axisLabel:{color:"#6b7d8e",fontSize:10},splitLine:{show:false}},
     yAxis:{type:"value",axisLabel:{color:"#6b7d8e",fontSize:10,formatter:v=>v+"%"},splitLine:{lineStyle:{color:"rgba(42,58,74,0.3)"}}},
-    series:[{type:"line",data:ddVals,symbol:"none",lineStyle:{color:"#ff4757",width:1.5},areaStyle:{color:"rgba(255,71,87,0.15)"}}],
+    series:[{type:"line",data:ddData,symbol:"none",lineStyle:{color:"#ff4757",width:1.5},areaStyle:{color:"rgba(255,71,87,0.15)"}}],
   },true);
 }
 function renderTrades(testTrades,trainTrades){
@@ -332,30 +336,31 @@ function renderStockChart(data){
     xAxis:[{type:"category",data:dates,gridIndex:0,axisLabel:{color:"#6b7d8e",fontSize:9,formatter:v=>v.slice(5)},axisLine:{lineStyle:{color:"#2a3a4a"}}},
            {type:"category",data:dates,gridIndex:1,axisLabel:{show:false},axisLine:{show:false},axisTick:{show:false}}],
     yAxis:[{type:"value",gridIndex:0,axisLabel:{color:"#6b7d8e",fontSize:10},splitLine:{lineStyle:{color:"rgba(42,58,74,0.3)"}},scale:true},
-           {type:"value",gridIndex:1,min:0,max:1,axisLabel:{color:"#6b7d8e",fontSize:9,formatter:v=>(v*100).toFixed(0)+"%"},splitLine:{lineStyle:{color:"rgba(42,58,74,0.2)"}}}],
+           {type:"value",gridIndex:1,min:0,max:100,axisLabel:{color:"#6b7d8e",fontSize:9,formatter:v=>v.toFixed(0)},splitLine:{lineStyle:{color:"rgba(42,58,74,0.2)"}}}],
     series:[
       {type:"candlestick",name:"K线",data:candles,xAxisIndex:0,yAxisIndex:0,
        itemStyle:{color:"#ff0000",color0:"#00aa00",borderColor:"#ff0000",borderColor0:"#00aa00"}},
       {type:"scatter",name:"买入",data:buyMarks,xAxisIndex:0,yAxisIndex:0,z:10},
       {type:"scatter",name:"卖出",data:sellMarks,xAxisIndex:0,yAxisIndex:0,z:10},
-      {type:"line",name:"MA60偏离",data:data.bottom,xAxisIndex:1,yAxisIndex:1,
+      {type:"line",name:"主力评分",data:data.scores,xAxisIndex:1,yAxisIndex:1,
        symbol:"none",smooth:true,lineStyle:{color:"#f9ca24",width:2},
        areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:"rgba(249,202,36,0.2)"},{offset:1,color:"rgba(249,202,36,0.0)"}])},
-       markLine:{silent:true,symbol:"none",data:[{yAxis:0.3,lineStyle:{color:"#00d4aa",type:"dashed"},label:{formatter:"底部区",color:"#00d4aa",fontSize:10}}]}},
+       markLine:{silent:true,symbol:"none",data:[{yAxis:40,lineStyle:{color:"#00d4aa",type:"dashed"},label:{formatter:"主力线40",color:"#00d4aa",fontSize:10}}]}},
     ],
   },true);
 }
-function renderBottomDist(){
-  const cats=["0-10%","10-20%","20-30%","30-40%","40-50%","50-60%","60-70%","70-80%","80-90%","90-100%"];
-  const counts=[Math.floor(Math.random()*20+5),Math.floor(Math.random()*30+10),Math.floor(Math.random()*35+15),Math.floor(Math.random()*40+20),Math.floor(Math.random()*50+25),Math.floor(Math.random()*45+20),Math.floor(Math.random()*35+15),Math.floor(Math.random()*25+10),Math.floor(Math.random()*20+5),Math.floor(Math.random()*10+2)];
-  charts.bottom.setOption({
-    tooltip:{trigger:"axis",backgroundColor:"rgba(26,35,50,0.95)",borderColor:"#2a3a4a",textStyle:{color:"#c8d6e5"}},
-    grid:{left:60,right:30,top:10,bottom:50},
-    xAxis:{type:"category",data:cats,axisLabel:{color:"#6b7d8e",fontSize:9,rotate:30}},
-    yAxis:{type:"value",name:"股票数量",nameTextStyle:{color:"#6b7d8e"},axisLabel:{color:"#6b7d8e",fontSize:10}},
-    series:[{type:"bar",data:counts,itemStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:"#00d4aa"},{offset:1,color:"#4a9eff"}])},
-      markLine:{silent:true,data:[{xAxis:"10-20%",lineStyle:{color:"#f9ca24",type:"dashed",width:2},label:{formatter:"选股区",color:"#f9ca24"}}]}}],
-  },true);
+function renderHoldings(trainH, testH){
+  const render=(data,tbId,valId)=>{
+    const tb=document.getElementById(tbId);
+    if(!data||data.length===0){tb.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text-dim)">暂无</td></tr>';return}
+    let total=0;
+    tb.innerHTML=data.map(h=>{total+=h.value||0;return`
+      <tr><td><b>${h.name}</b></td><td>${(h.shares/100).toFixed(0)}</td><td>${h.avg_cost}</td><td>${h.price}</td>
+      <td class="${h.pnl_pct>0?'green':'red'}">${h.pnl_pct>0?'+':''}${h.pnl_pct}%</td></tr>`}).join('');
+    document.getElementById(valId).textContent='(持仓市值 '+(total/10000).toFixed(0)+'万)';
+  };
+  render(trainH,'trainHoldingBody','trainHoldingVal');
+  render(testH,'testHoldingBody','testHoldingVal');
 }
 function openConfig(){document.getElementById("configModal").classList.add("active")}
 function closeConfig(){document.getElementById("configModal").classList.remove("active")}
@@ -371,7 +376,7 @@ function closeConfig(){document.getElementById("configModal").classList.remove("
 
 if __name__ == "__main__":
     print("\n" + "=" * 55)
-    print("  底部吸筹策略 · 可视化回测平台")
+    print("  涨停放量策略 · 可视化回测平台")
     print("=" * 55)
     print(f"  地址: http://127.0.0.1:5000")
     print(f"  股票池: {len(FULL_UNIVERSE)}只全行业")
