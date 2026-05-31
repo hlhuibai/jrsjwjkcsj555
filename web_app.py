@@ -12,7 +12,7 @@ from engine import (
     FULL_UNIVERSE, BENCHMARK_INDICES, DEFAULT_CONFIG,
     TRAIN_PERIOD, TEST_PERIOD, TEST_TRADE_START,
     generate_price_data, generate_index_data,
-    run_dual_period, _data_cache, _load_cache,
+    run_dual_period, update_daily_data, _data_cache, _load_cache,
 )
 from indicators import (
     calc_main_force_score, calc_institutional_flow, calc_mfi,
@@ -189,8 +189,8 @@ tr:hover td{background:rgba(74,158,255,.05)}
   <div class="modal">
     <h2>回测参数配置</h2>
     <div class="field-row">
-      <div class="field"><label>训练集</label><input value="2024-01-01 ~ 2025-12-31" readonly style="background:var(--bg);color:var(--text-dim);"></div>
-      <div class="field"><label>测试集</label><input value="2026-01-01 ~ 2026-05-27" readonly style="background:var(--bg);color:var(--text-dim);"></div>
+      <div class="field"><label>训练集</label><input value="2021-06-01 ~ 2023-12-31" readonly style="background:var(--bg);color:var(--text-dim);"></div>
+      <div class="field"><label>测试集</label><input value="2023-10-01 ~ ''' + TEST_PERIOD[1] + r'''" readonly style="background:var(--bg);color:var(--text-dim);"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>初始资金</label><input type="number" id="cfgCapital" value="1000000" step="100000"></div>
@@ -383,16 +383,16 @@ if __name__ == "__main__":
     print(f"  架构: web_app.py → engine.py → indicators.py")
     print("=" * 55 + "\n")
 
-    print("[预热] 加载数据...")
+    print("[预热] 加载缓存到内存...")
     for sym, name in FULL_UNIVERSE:
-        key = f"stock_{sym}_2024-01-01_2025-12-31"
+        key = f"stock_{sym}"
         if key not in _data_cache:
-            df = _load_cache(sym, "2024-01-01", "2025-12-31")
+            df = _load_cache(sym)
             if df is not None: _data_cache[key] = df
     for idx_sym, idx_name in BENCHMARK_INDICES:
-        key = f"idx_{idx_sym}_2024-01-01_2025-12-31"
+        key = f"idx_{idx_sym}"
         if key not in _data_cache:
-            df = _load_cache(idx_sym, "2024-01-01", "2025-12-31")
+            df = _load_cache(idx_sym)
             if df is not None: _data_cache[key] = df
     print("[预热] 数据就绪，运行回测...")
     _cached_result = run_dual_period()

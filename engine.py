@@ -3,7 +3,7 @@
 仅供算法同学修改，web层通过 run_full_backtest() 调用
 """
 
-import os, sys, numpy as np, pandas as pd
+import os, sys, glob, datetime, numpy as np, pandas as pd
 sys.path.insert(0, os.path.dirname(__file__))
 from indicators import (
     calc_main_force_score, calc_institutional_flow, calc_mfi,
@@ -98,9 +98,16 @@ DEFAULT_CONFIG = {
     "reserve_cash_pct": 0.10,
 }
 
-TRAIN_PERIOD = ("2024-01-01", "2025-12-31")
-TEST_PERIOD  = ("2025-07-01", "2026-05-27")   # 提前半年加载数据，但只在2026年交易
-TEST_TRADE_START = "2026-01-01"
+TRAIN_PERIOD = ("2021-06-01", "2023-12-31")
+def _today_str():
+    """返回最近交易日，周末自动回退到周五"""
+    today = datetime.date.today()
+    while today.weekday() >= 5:  # 周六/日 → 回退
+        today = today - datetime.timedelta(days=1)
+    return today.strftime("%Y-%m-%d")
+
+TEST_PERIOD = ("2023-10-01", _today_str())   # 提前3月加载数据，给Q1提供lookback
+TEST_TRADE_START = "2024-01-02"
 
 _cached_result = None
 _data_cache = {}
@@ -115,20 +122,34 @@ def _sym_to_tx(symbol):
     code, mkt = symbol.split(".")
     return f"{'sh' if mkt == 'SH' else 'sz'}{code}"
 
-def _cache_path(symbol, start, end):
+def _cache_path(symbol):
     os.makedirs(_CACHE_DIR, exist_ok=True)
     safe = symbol.replace(".", "_").replace("/", "_")
-    return os.path.join(_CACHE_DIR, f"{safe}_{start}_{end}.pkl")
+    return os.path.join(_CACHE_DIR, f"{safe}.pkl")
 
-def _load_cache(symbol, start, end):
-    path = _cache_path(symbol, start, end)
+def _load_cache(symbol):
+    """按股票代码加载缓存，自动从旧格式迁移"""
+    path = _cache_path(symbol)
     if os.path.exists(path):
         try: return pd.read_pickle(path)
         except: pass
+    # 迁移旧格式 {symbol}_{start}_{end}.pkl → {symbol}.pkl
+    safe = symbol.replace(".", "_").replace("/", "_")
+    try:
+        old_files = [f for f in os.listdir(_CACHE_DIR)
+                     if f.startswith(safe + "_") and f.endswith(".pkl")]
+        if old_files:
+            best = max(old_files, key=lambda f: os.path.getsize(
+                os.path.join(_CACHE_DIR, f)))
+            df = pd.read_pickle(os.path.join(_CACHE_DIR, best))
+            if df is not None:
+                _save_cache(symbol, df)
+                return df
+    except: pass
     return None
 
-def _save_cache(symbol, start, end, df):
-    try: df.to_pickle(_cache_path(symbol, start, end))
+def _save_cache(symbol, df):
+    try: df.to_pickle(_cache_path(symbol))
     except: pass
 
 def _fetch_tx_stock(symbol, start, end):
@@ -161,6 +182,7 @@ def _fetch_ak_index(symbol, start, end):
         df["symbol"] = symbol
         cols = ["close","symbol"]
         if "volume" in df.columns: cols.append("volume")
+        if "amount" in df.columns: cols.append("amount")
         return df[cols]
     except: return None
 
@@ -183,19 +205,66 @@ def _build_event_matrix(dates):
     return evt
 
 def generate_price_data(symbol, start, end, seed=None):
-    """获取个股数据：缓存 > 指数驱动合成（跳过akshare加速）"""
+    """获取个股数据：缓存增量更新 > akshare拉取 > 指数驱动合成"""
     if seed is None: seed = hash(symbol) % (2**31)
-    cache_key = f"stock_{symbol}_{start}_{end}"
-    if cache_key in _data_cache: return _data_cache[cache_key]
-    df = _load_cache(symbol, start, end)
-    if df is not None: _data_cache[cache_key] = df; return df
-    # 优先尝试akshare拉取真实数据
-    df = _fetch_tx_stock(symbol, start, end)
-    if df is not None:
-        _data_cache[cache_key] = df; _save_cache(symbol, start, end, df)
-        return df
+    cache_key = f"stock_{symbol}"
+    t_start, t_end = pd.Timestamp(start), pd.Timestamp(end)
 
-    # 合成
+    # 1. 内存缓存命中 → 直接返回切片
+    if cache_key in _data_cache:
+        df = _data_cache[cache_key]
+        if df is not None and len(df) > 0:
+            d_min, d_max = df.index.min(), df.index.max()
+            if d_min <= t_start and d_max >= t_end:
+                result = df.loc[t_start:t_end]
+                if len(result) >= 2: return result
+
+    # 2. 磁盘缓存 → 增量拉取缺失部分
+    df = _load_cache(symbol)
+    if df is not None and len(df) > 0:
+        d_min, d_max = df.index.min(), df.index.max()
+        need_new = d_max < t_end
+        need_old = d_min > t_start
+
+        if not need_new and not need_old:
+            _data_cache[cache_key] = df
+            result = df.loc[t_start:t_end]
+            if len(result) >= 2: return result
+
+        if need_new:
+            gap_days = (t_end - d_max).days
+            if gap_days > 2:  # 差距≤2天通常是周末/假期，跳过无效HTTP
+                fetch_start = (d_max + pd.Timedelta(days=1)).strftime("%Y%m%d")
+                new_df = _fetch_tx_stock(symbol, fetch_start, end.replace("-", ""))
+                if new_df is not None and not new_df.empty:
+                    df = pd.concat([df, new_df])
+                    df = df[~df.index.duplicated(keep="last")]
+                    df.sort_index(inplace=True)
+
+        if need_old:
+            gap_days = (d_min - t_start).days
+            if gap_days > 2:  # 差距≤2天（节假日错位），跳过
+                fetch_end = (d_min - pd.Timedelta(days=1)).strftime("%Y%m%d")
+                old_df = _fetch_tx_stock(symbol, start.replace("-", ""), fetch_end)
+                if old_df is not None and not old_df.empty:
+                    df = pd.concat([old_df, df])
+                    df = df[~df.index.duplicated(keep="last")]
+                    df.sort_index(inplace=True)
+
+        _data_cache[cache_key] = df
+        _save_cache(symbol, df)
+        result = df.loc[t_start:t_end]
+        if len(result) >= 2: return result
+
+    # 3. 无缓存 → akshare全量拉取
+    df = _fetch_tx_stock(symbol, start, end)
+    if df is not None and not df.empty:
+        _data_cache[cache_key] = df
+        _save_cache(symbol, df)
+        result = df.loc[t_start:t_end]
+        if len(result) >= 2: return result
+
+    # 4. 合成兜底
     rng = np.random.default_rng(seed)
     dates = pd.bdate_range(start=pd.Timestamp(start), end=pd.Timestamp(end))
     n = len(dates)
@@ -226,16 +295,35 @@ def generate_price_data(symbol, start, end, seed=None):
     return df
 
 def generate_index_data(symbol, name, start, end):
-    cache_key = f"idx_{symbol}_{start}_{end}"
-    if cache_key in _data_cache: return _data_cache[cache_key]
-    df = _load_cache(symbol, start, end)
-    if df is not None: _data_cache[cache_key] = df; return df
+    cache_key = f"idx_{symbol}"
+    t_start, t_end = pd.Timestamp(start), pd.Timestamp(end)
+
+    # 1. 内存缓存
+    if cache_key in _data_cache:
+        df = _data_cache[cache_key]
+        if df is not None and len(df) > 0:
+            d_min, d_max = df.index.min(), df.index.max()
+            if d_min <= t_start and d_max >= t_end:
+                return df.loc[t_start:t_end]
+
+    # 2. 磁盘缓存
+    df = _load_cache(symbol)
+    if df is not None and len(df) > 0:
+        d_min, d_max = df.index.min(), df.index.max()
+        if d_min <= t_start and d_max >= t_end:
+            df["name"] = name
+            _data_cache[cache_key] = df
+            return df.loc[t_start:t_end]
+
+    # 3. akshare拉取
     df = _fetch_ak_index(symbol, start, end)
-    if df is not None:
-        df["name"] = name; _data_cache[cache_key] = df
-        _save_cache(symbol, start, end, df)
+    if df is not None and not df.empty:
+        df["name"] = name
+        _data_cache[cache_key] = df
+        _save_cache(symbol, df)
         return df
-    # fallback synthetic
+
+    # 4. 合成兜底
     rng = np.random.default_rng(hash(symbol)%(2**31))
     dates = pd.bdate_range(start=pd.Timestamp(start), end=pd.Timestamp(end))
     n = len(dates)
@@ -258,7 +346,6 @@ def generate_index_data(symbol, name, start, end):
 def _load_all_mcap():
     """启动时一次性加载全部市值数据到内存"""
     try:
-        import pandas as pd, os, glob
         mcap = {}
         for path in glob.glob(os.path.join(_CACHE_DIR, "mcap", "*.pkl")):
             code = os.path.basename(path).replace(".pkl", "")
@@ -299,6 +386,24 @@ def run_full_backtest(config):
 
     all_dates = sorted(set().union(*[set(d["df"].index) for d in all_data.values()]))
 
+    # 全市场成交额（上证+深证，BaoStock源），用于量能冰点判断
+    _total_market_amt = None
+    try:
+        import baostock as bs
+        bs.login()
+        rs = bs.query_history_k_data_plus("sh.000001", "date,amount",
+            start_date=cfg["start_date"], end_date=cfg["end_date"])
+        sh = rs.get_data()
+        rs2 = bs.query_history_k_data_plus("sz.399001", "date,amount",
+            start_date=cfg["start_date"], end_date=cfg["end_date"])
+        sz = rs2.get_data()
+        bs.logout()
+        if sh is not None and sz is not None and len(sh) > 0:
+            sh["date"] = pd.to_datetime(sh["date"]); sh.set_index("date", inplace=True)
+            sz["date"] = pd.to_datetime(sz["date"]); sz.set_index("date", inplace=True)
+            _total_market_amt = (sh["amount"].astype(float) + sz["amount"].astype(float))
+    except: pass
+
     cash = initial_capital
     positions = {}
     trades = []
@@ -337,19 +442,22 @@ def run_full_backtest(config):
             if date not in df.index: continue
             idx = df.index.get_loc(date)
             if idx < 20: continue
-            # 5日内涨停(>=9.5%)且当日量>20日均量×2 = 大资金进场信号
+            # 5日内涨停(>=8%)且量异常放大 = 大资金进场信号
+            # 双基线：20日均量(短线) + 60日均量(长线)，防止持续放量抬高基线导致漏检
             vol_ma20 = df["volume"].iloc[max(0,idx-20):idx+1].mean()
+            vol_ma60 = df["volume"].iloc[max(0,idx-60):idx+1].mean()
             if vol_ma20 <= 0: continue
             breakout_score = 0.0
-            for j in range(max(1, idx-5), idx+1):
+            for j in range(max(1, idx-10), idx+1):
                 if j >= len(df): break
                 pct = (df["close"].iloc[j] - df["close"].iloc[j-1]) / df["close"].iloc[j-1]
                 vol = df["volume"].iloc[j]
-                if pct >= 0.08 and vol > vol_ma20 * 2.0:
-                    # 涨幅越大、量越大、越近期 → 分越高
-                    recency = 1.0 - (idx - j) / 5.0
-                    vol_ratio = min(vol / (vol_ma20 * 2.0), 3.0)
-                    breakout_score = 100.0 * recency * 0.5 + 100.0 * (vol_ratio / 3.0) * 0.5
+                # 路径A: 短线暴量(>20日均量×2)  路径B: 持续放量但长基线仍异常
+                vol_ok = vol > vol_ma20 * 2.0 or (vol > vol_ma20 * 1.2 and vol_ma60 > 0 and vol > vol_ma60 * 1.8)
+                if pct >= 0.08 and vol_ok:
+                    recency = 1.0 - (idx - j) / 10.0
+                    vol_ratio = min(vol / max(vol_ma20, 1), 4.0)
+                    breakout_score = 100.0 * recency * 0.5 + 100.0 * min(vol_ratio / 4.0, 1.0) * 0.5
                     break
             # 市值过滤：真实市值 > 300亿（内存查找，极快）
             code = sym.split(".")[0]
@@ -391,18 +499,29 @@ def run_full_backtest(config):
             p = _p(s, date)
             if p is not None: tv += positions[s]["shares"] * p
 
-        # ── 大盘风控：沪深300 < MA20 且 量 < MA5 → 总仓位 ≤ 20% ──
+        # ── 大盘风控：双MA分级 ──
+        # Level 1 (risk_off):  沪深300<MA20 且缩量 → 仓位上限20%（牛回调）
+        # Level 2 (bear_market): 沪深300<MA20 且<MA60 → 禁止开仓（熊市）
         risk_off = False
+        bear_market = False
         hs300 = benchmark_data.get("000300.SH")
         if hs300 is not None and date in hs300.index:
             idx_hs = hs300.index.get_loc(date)
-            if idx_hs >= 20:
+            if idx_hs >= 60:
                 ma20 = float(hs300["close"].iloc[max(0,idx_hs-20):idx_hs+1].mean())
+                ma60 = float(hs300["close"].iloc[max(0,idx_hs-60):idx_hs+1].mean())
                 ma5_vol = float(hs300["volume"].iloc[max(0,idx_hs-5):idx_hs+1].mean())
                 today_close = float(hs300["close"].iloc[idx_hs])
                 today_vol = float(hs300["volume"].iloc[idx_hs])
                 if today_close < ma20 and today_vol < ma5_vol:
-                    risk_off = True
+                    if today_close < ma60:
+                        bear_market = True
+                    else:
+                        risk_off = True
+                # 全市场量能冰点 → 强制空仓（上证+深证成交额 < 8000亿）
+                if _total_market_amt is not None and date in _total_market_amt.index:
+                    if float(_total_market_amt.loc[date]) < 8000_0000_0000:
+                        bear_market = True
 
         # 卖出：止损/半仓止盈/移动止损
         if date.strftime("%Y-%m-%d") >= trade_start:
@@ -464,38 +583,39 @@ def run_full_backtest(config):
             current_total_pct = (tv - cash) / tv if tv > 0 else 0
             max_allowed_pct = 0.20 if risk_off else 1.0
 
-            for sym, bk_score, mf in detailed:
-                if len(positions) >= max_positions: break
-                if sym in positions: continue
-                if mf < 40: continue
-                if risk_off and current_total_pct >= max_allowed_pct: break
+            if not bear_market:  # 熊市确认 → 跳过所有买入（卖出照常执行）
+                for sym, bk_score, mf in detailed:
+                    if len(positions) >= max_positions: break
+                    if sym in positions: continue
+                    if mf < 40: continue
+                    if risk_off and current_total_pct >= max_allowed_pct: break
 
-                df_sym = all_data[sym]["df"]
-                if date not in df_sym.index: continue
-                # 一字涨停买不进
-                one_word, _ = _is_one_word(df_sym, date)
-                if one_word: continue
-                day_high = float(df_sym.loc[date, "high"])
-                price = day_high * 0.982
-                if price <= 0: continue
+                    df_sym = all_data[sym]["df"]
+                    if date not in df_sym.index: continue
+                    # 一字涨停买不进
+                    one_word, _ = _is_one_word(df_sym, date)
+                    if one_word: continue
+                    day_high = float(df_sym.loc[date, "high"])
+                    price = day_high * 0.982
+                    if price <= 0: continue
 
-                target_pct = 0.05 + (max_single_pct - 0.05) * (bk_score / 100.0)
-                tgt_val = min(target_pct * tv, cash * (1 - reserve))
-                if tgt_val < 5000: continue
-                shares = int(tgt_val / price / 100) * 100
-                if shares < 100: continue
-                cost = shares * price + max(shares * price * 0.00011, 5)
-                if cost > cash: continue
-                comm = max(shares * price * 0.00011, 5)
-                total_commission += comm
-                cash -= cost
-                positions[sym] = {"shares":shares,"avg_cost":price,
-                    "entry_date":date.strftime("%Y-%m-%d"),"high_price":price,
-                    "half_taken":False}
-                trades.append({"date":date.strftime("%Y-%m-%d"),"symbol":sym,
-                    "name":all_data[sym]["name"],"action":"buy","price":round(price,2),
-                    "shares":shares,"amount":round(cost,0),"pnl_pct":0,
-                    "reason":f"涨停放量 强度={bk_score:.0f} 仓={target_pct*100:.0f}%"})
+                    target_pct = 0.05 + (max_single_pct - 0.05) * (bk_score / 100.0)
+                    tgt_val = min(target_pct * tv, cash * (1 - reserve))
+                    if tgt_val < 5000: continue
+                    shares = int(tgt_val / price / 100) * 100
+                    if shares < 100: continue
+                    cost = shares * price + max(shares * price * 0.00011, 5)
+                    if cost > cash: continue
+                    comm = max(shares * price * 0.00011, 5)
+                    total_commission += comm
+                    cash -= cost
+                    positions[sym] = {"shares":shares,"avg_cost":price,
+                        "entry_date":date.strftime("%Y-%m-%d"),"high_price":price,
+                        "half_taken":False}
+                    trades.append({"date":date.strftime("%Y-%m-%d"),"symbol":sym,
+                        "name":all_data[sym]["name"],"action":"buy","price":round(price,2),
+                        "shares":shares,"amount":round(cost,0),"pnl_pct":0,
+                        "reason":f"涨停放量 强度={bk_score:.0f} 仓={target_pct*100:.0f}%"})
 
         # 净值
         sv = sum(pos["shares"]*_p(s,date) for s,pos in positions.items() if _p(s,date) is not None)
@@ -592,12 +712,13 @@ def run_dual_period(config=None):
     test_cfg  = {**cfg, "start_date": TEST_PERIOD[0],  "end_date": TEST_PERIOD[1], "trade_start": TEST_TRADE_START}
     train_result = run_full_backtest(train_cfg)
     test_result  = run_full_backtest(test_cfg)
-    # 测试集净值只保留交易期（跳过01-01假期等非交易日）
+    # 测试集净值只保留交易期
     test_result["equity_series"] = [e for e in test_result["equity_series"] if e[0] > TEST_TRADE_START]
     test_result["drawdown_series"] = [d for d in test_result["drawdown_series"] if d[0] > TEST_TRADE_START]
-    # 基准指数重新归一化到训练集，消除接头断层
+    # 基准指数从数据起始日展示；归一化到训练集接头
+    test_start = TEST_PERIOD[0]
     for k in test_result.get("benchmark_series", {}):
-        filtered = [b for b in test_result["benchmark_series"][k] if b[0] > TEST_TRADE_START]
+        filtered = [b for b in test_result["benchmark_series"][k] if b[0] > test_start]
         if filtered and k in train_result.get("benchmark_series", {}):
             train_bm = train_result["benchmark_series"][k]
             if train_bm:
@@ -605,3 +726,40 @@ def run_dual_period(config=None):
                 filtered = [[b[0], round(b[1]*scale, 4)] for b in filtered]
         test_result["benchmark_series"][k] = filtered
     return {"train": train_result, "test": test_result, "params": cfg}
+
+
+# ═══════════════════════════════════════════════════════════
+# 每日自动更新
+# ═══════════════════════════════════════════════════════════
+
+def update_daily_data():
+    """每日增量拉取所有股票+指数的最新交易日数据，写入缓存。
+    可在收盘后(15:30+)通过 Windows 任务计划 / cron 调用。"""
+    today = _today_str()
+    start = TRAIN_PERIOD[0]
+    updated, failed = [], []
+
+    for sym, name in FULL_UNIVERSE:
+        try:
+            df = generate_price_data(sym, start, today)
+            if df is not None: updated.append(sym)
+            else: failed.append(sym)
+        except Exception as e:
+            failed.append(f"{sym}: {e}")
+
+    for idx_sym, idx_name in BENCHMARK_INDICES:
+        try:
+            df = generate_index_data(idx_sym, idx_name, start, today)
+            if df is not None: updated.append(idx_sym)
+            else: failed.append(idx_sym)
+        except Exception as e:
+            failed.append(f"{idx_sym}: {e}")
+
+    return {"date": today, "updated": len(updated), "failed": len(failed),
+            "failed_list": failed[:10]}
+
+
+if __name__ == "__main__":
+    import json
+    result = update_daily_data()
+    print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -8,45 +8,23 @@ import pandas as pd
 
 
 def rolling_sum(series, window):
-    """滚动求和"""
-    result = np.empty(len(series))
-    result[:] = np.nan
-    for i in range(window - 1, len(series)):
-        result[i] = np.nansum(series[i - window + 1 : i + 1])
-    return result
+    """滚动求和 (pandas C级向量化)"""
+    return pd.Series(series).rolling(window, min_periods=window).sum().values
 
 
 def rolling_mean(series, window):
-    """滚动均值"""
-    result = np.empty(len(series))
-    result[:] = np.nan
-    for i in range(window - 1, len(series)):
-        result[i] = np.nanmean(series[i - window + 1 : i + 1])
-    return result
+    """滚动均值 (pandas C级向量化)"""
+    return pd.Series(series).rolling(window, min_periods=window).mean().values
 
 
 def rolling_std(series, window):
-    """滚动标准差"""
-    result = np.empty(len(series))
-    result[:] = np.nan
-    for i in range(window - 1, len(series)):
-        result[i] = np.nanstd(series[i - window + 1 : i + 1])
-    return result
+    """滚动标准差 (pandas C级向量化)"""
+    return pd.Series(series).rolling(window, min_periods=window).std().values
 
 
 def ema(series, period):
-    """指数加权移动平均"""
-    result = np.empty(len(series))
-    result[:] = np.nan
-    k = 2.0 / (period + 1)
-    for i in range(len(series)):
-        if np.isnan(series[i]):
-            continue
-        if i == 0 or np.isnan(result[i - 1]):
-            result[i] = series[i]
-        else:
-            result[i] = series[i] * k + result[i - 1] * (1 - k)
-    return result
+    """指数加权移动平均 (pandas C级向量化)"""
+    return pd.Series(series).ewm(span=period, adjust=False).mean().values
 
 
 # ─── 核心指标 ───────────────────────────────────────────────
@@ -207,10 +185,10 @@ def calc_main_force_score(
     for i in range(60, n):
         s = 0.0
 
-        # ① 资金流向强度 (40分)
+        # ① 资金流向强度 (40分) —— 绝对值+相对值双门槛
         flow_val = inst_flow[i]
         flow_std = np.nanstd(inst_flow[max(0,i-14):i+1])
-        if flow_std > 0:
+        if flow_std > 0:  # 绝对值<200的不算有主力
             s += 40.0 * min(max((flow_val / flow_std + 1.0) / 2.0, 0), 1)
 
         # ② 均线多头排列 (25分) — MA5 > MA10 > MA20
